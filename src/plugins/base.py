@@ -287,6 +287,15 @@ class AnalysisPlugin(ABC, Generic[PayloadT, ContextT]):
         facts.trace_ids.extend(trace_ids)
         return facts
 
+    def derive_facts(self, request: AbstractionRequest) -> Optional[FactEnvelope[PayloadT]]:
+        """Optional deterministic fact derivation hook.
+
+        Plugins that can derive their complete fact envelope from source syntax
+        or project metadata may override this to avoid an LLM abstraction call.
+        Returning None preserves the standard prompt -> LLM -> parse path.
+        """
+        return None
+
     # -- (b) composition -------------------------------------------------------
 
     @abstractmethod

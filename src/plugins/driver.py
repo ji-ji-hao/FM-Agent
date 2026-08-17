@@ -164,7 +164,7 @@ def _load_facts_checkpoint(
     expected_fingerprint: Optional[str] = None,
 ) -> Optional[FactEnvelope]:
     """Load a previously-checkpointed FactEnvelope for `unit`, or None if absent
-    or unreadable (a corrupt/partial file is ignored so the unit is re-derived)."""
+    or unusable (a corrupt/partial/error file is ignored so the unit is re-derived)."""
     path = _facts_cache_path(cache_dir, unit)
     if not os.path.exists(path):
         return None
@@ -181,7 +181,8 @@ def _load_facts_checkpoint(
                 or cached_fingerprint != expected_fingerprint
             ):
                 return None
-        return _deserialize_facts(serialized)
+        facts = _deserialize_facts(serialized)
+        return None if facts.status == "error" else facts
     except (OSError, json.JSONDecodeError, ValueError, KeyError, TypeError):
         return None
 
@@ -590,6 +591,19 @@ def _resolved_calls(
     return out
 
 
+def _has_uncacheable_callee(
+    unit: FunctionUnit,
+    facts_by_fn: Mapping[FunctionId, FactEnvelope],
+    uncacheable_fns: set,
+    program: ProgramIndex,
+) -> bool:
+    for site in program.calls_by_caller.get(unit.id, ()):
+        cf = facts_by_fn.get(site.callee)
+        if cf is not None and (cf.status == "error" or site.callee in uncacheable_fns):
+            return True
+    return False
+
+
 def _run_top_down_context_worklist(
     plugin: AnalysisPlugin,
     program: ProgramIndex,
@@ -680,8 +694,12 @@ def run_plugin(plugin: AnalysisPlugin, proj_dir: str, work_subdir: Optional[str]
     if verbose:
         print(f"[{name}] Stage 2/4: build call graph ({len(units)} functions)...")
     program = callgraph.build_program_index(units)
+    select_relevance_slice = getattr(plugin, "select_relevance_slice", None)
+    requested_slice = (
+        select_relevance_slice(program) if callable(select_relevance_slice) else None
+    )
     selected = _validated_relevance_slice(
-        plugin, plugin.select_relevance_slice(program), program
+        plugin, requested_slice, program
     )
     full_order = callgraph.order_bottom_up(units)
     fingerprint = selected.fingerprint if selected is not None else None
@@ -744,18 +762,31 @@ def run_plugin(plugin: AnalysisPlugin, proj_dir: str, work_subdir: Optional[str]
             f"(layers={len(layers)}, workers={workers})..."
         )
     facts_by_fn: Dict[FunctionId, FactEnvelope] = {}
+    uncacheable_fns = set()
     resumed = 0
     derived = 0
 
-    def derive_raw(unit: FunctionUnit) -> tuple[FactEnvelope, bool]:
+    def derive_raw(unit: FunctionUnit) -> tuple[FactEnvelope, bool, bool]:
+        has_uncacheable_callee = _has_uncacheable_callee(
+            unit, facts_by_fn, uncacheable_fns, context_program
+        )
         # Checkpoint stores ONLY the pre-compose abstraction (the sole expensive,
         # rate-limit-prone LLM step). Composition is deterministic and cheap, so
         # it is ALWAYS re-run below over the current facts_by_fn — this keeps the
         # cache independent of call-graph/compose changes and lets a resumed run
         # rebuild composition consistently from callees that may also be cached.
-        facts = _load_facts_checkpoint(cache_dir, unit, fingerprint)
+        #
+        # Do not load or write checkpoints for a caller whose prompt depends on
+        # an error callee (directly or through another uncached caller). If the
+        # callee succeeds on a later resume, every affected caller must be
+        # re-derived with the corrected callee facts.
+        facts = (
+            None
+            if has_uncacheable_callee
+            else _load_facts_checkpoint(cache_dir, unit, fingerprint)
+        )
         if facts is not None:
-            return facts, True
+            return facts, True, False
         ctx = _make_context(context_program, unit, entrypoints)
         callee_ctx = _referenced_callee_context(
             plugin, unit, facts_by_fn, context_program
@@ -765,10 +796,19 @@ def run_plugin(plugin: AnalysisPlugin, proj_dir: str, work_subdir: Optional[str]
             trace_dir=trace_dir,
             trace_meta={"function_id": unit.id.rel, "language": unit.id.language},
         )
-        facts = _call_llm_with_retries(plugin, request, model, max_iter)
-        # Persist raw facts before composition so a crash never loses LLM work.
-        _write_facts_checkpoint(cache_dir, unit, facts, fingerprint)
-        return facts, False
+        derive_facts = getattr(plugin, "derive_facts", None)
+        facts = derive_facts(request) if callable(derive_facts) else None
+        if facts is None:
+            facts = _call_llm_with_retries(plugin, request, model, max_iter)
+        # Persist usable raw abstractions before composition. Error facts and
+        # callers tainted by an error callee must be retried on the next run.
+        if facts.status != "error" and not has_uncacheable_callee:
+            _write_facts_checkpoint(cache_dir, unit, facts, fingerprint)
+        return (
+            facts,
+            False,
+            facts.status == "error" or has_uncacheable_callee,
+        )
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
         for layer in layers:
@@ -779,10 +819,15 @@ def run_plugin(plugin: AnalysisPlugin, proj_dir: str, work_subdir: Optional[str]
             )
             raw_by_fn = {
                 unit.id: facts
-                for unit, (facts, _) in zip(layer, raw_results)
+                for unit, (facts, _, _) in zip(layer, raw_results)
             }
-            resumed += sum(from_cache for _, from_cache in raw_results)
-            derived += sum(not from_cache for _, from_cache in raw_results)
+            resumed += sum(from_cache for _, from_cache, _ in raw_results)
+            derived += sum(not from_cache for _, from_cache, _ in raw_results)
+            uncacheable_fns.update(
+                unit.id
+                for unit, (_, _, is_uncacheable) in zip(layer, raw_results)
+                if is_uncacheable
+            )
 
             composition_inputs = dict(facts_by_fn)
             composition_inputs.update(raw_by_fn)
