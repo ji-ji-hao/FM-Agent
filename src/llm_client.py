@@ -159,7 +159,7 @@ def _read_error_body(exc, limit=800):
     return text[:limit] + ("…" if len(text) > limit else "")
 
 
-def _retry_create(client, model, messages):
+def _retry_create(client, model, messages, *, disable_thinking=False):
     """Call the LLM with retries. Returns (text, usage_dict).
 
     - Anthropic-family models go via the native /v1/messages endpoint.
@@ -174,8 +174,17 @@ def _retry_create(client, model, messages):
     transient_attempts = 0
     use_anthropic = _is_anthropic_model(model)
     extra = {}
+    extra_body = {}
     if _should_inject_user_id(LLM_API_BASE_URL):
-        extra["extra_body"] = _metadata_body()
+        extra_body.update(_metadata_body())
+    if (
+        disable_thinking
+        and model in {"deepseek-v4-flash", "deepseek-v4-pro"}
+        and LLM_API_BASE_URL.rstrip("/") == "https://api.deepseek.com"
+    ):
+        extra_body["thinking"] = {"type": "disabled"}
+    if extra_body:
+        extra["extra_body"] = extra_body
     while True:
         try:
             if use_anthropic:

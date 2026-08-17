@@ -76,6 +76,16 @@ class FunctionUnit:
     signature_line: str
     params: Sequence[str] = field(default_factory=tuple)
     abs_path: Optional[str] = None
+    original_rel: Optional[str] = None
+    original_source: Optional[str] = None
+    original_sha256: Optional[str] = None
+
+
+@dataclass(frozen=True, slots=True)
+class RelevanceSlice:
+    """Functions eligible for analysis, bound to deterministic inputs."""
+    function_ids: tuple[FunctionId, ...]
+    fingerprint: str
 
 
 @dataclass(frozen=True)
@@ -211,6 +221,8 @@ class PluginMetadata:
       bottom-up facts exist (access control needs it; typestate benefits).
     `needs_entrypoint`: the checker uses DriverContext.is_entrypoint as a trust
       boundary (IFC does: an entrypoint's return is an external sink).
+    `aggregate_only`: suppress per-function verdict progress in the CLI while
+      retaining per-function evidence files and the plugin summary.
     """
     name: str
     version: str
@@ -220,6 +232,7 @@ class PluginMetadata:
     requires_top_down_context: bool = False
     needs_entrypoint: bool = False
     supports_recursion: bool = False
+    aggregate_only: bool = False
 
 
 # --- the plugin interface -----------------------------------------------------
@@ -241,6 +254,12 @@ class AnalysisPlugin(ABC, Generic[PayloadT, ContextT]):
     def metadata(self) -> PluginMetadata:
         """Static capabilities + driver requirements."""
 
+    def select_relevance_slice(
+        self, program: ProgramIndex
+    ) -> RelevanceSlice | None:
+        """Select eligible functions, or None for the full program."""
+        return None
+
     # -- (a) LLM abstraction step ---------------------------------------------
 
     @abstractmethod
@@ -256,8 +275,17 @@ class AnalysisPlugin(ABC, Generic[PayloadT, ContextT]):
 
     @abstractmethod
     def make_error_facts(self, request: AbstractionRequest, error: str) -> FactEnvelope[PayloadT]:
-        """Produce fail-closed facts after retries are exhausted or the call
-        raised. For security plugins this MUST lead to ERROR/unsafe, never SECURE."""
+        """Produce fail-closed facts after an LLM call raises."""
+
+    def make_format_exhausted_facts(
+        self,
+        request: AbstractionRequest,
+        error: str,
+        trace_ids: Sequence[str],
+    ) -> FactEnvelope[PayloadT]:
+        facts = self.make_error_facts(request, error)
+        facts.trace_ids.extend(trace_ids)
+        return facts
 
     # -- (b) composition -------------------------------------------------------
 

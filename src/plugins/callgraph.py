@@ -15,6 +15,7 @@ behavior-preserving after migration.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import json
@@ -163,6 +164,14 @@ def signature_line(src: str, language: str) -> str:
         return s
     lines = src.splitlines()
     return lines[0] if lines else ""
+
+
+def signature_header(src: str, first_line: str) -> str:
+    start = src.find(first_line)
+    if start < 0:
+        return first_line
+    end = src.find("{", start)
+    return src[start:] if end < 0 else src[start:end]
 
 
 def _split_top_level(text: str, sep: str) -> List[str]:
@@ -361,6 +370,17 @@ def load_function_units(
     write_minimal_phases(work_dir, proj_dir, source_files)
     run_extraction(proj_dir, work_dir=work_dir, force=True, verbose=False)
 
+    originals = {}
+    for source_rel in source_files:
+        source_path = os.path.join(proj_dir, source_rel)
+        with open(source_path, "r", errors="replace") as source_file:
+            original_source = source_file.read()
+        originals[os.path.normpath(_extracted_source_dir(source_rel))] = (
+            source_rel.replace(os.sep, "/"),
+            original_source,
+            hashlib.sha256(original_source.encode("utf-8")).hexdigest(),
+        )
+
     units: List[FunctionUnit] = []
     for ap, rel in collect_extracted(input_dir, source_files=source_files):
         with open(ap, "r", errors="replace") as f:
@@ -374,11 +394,17 @@ def load_function_units(
             base_name=base_name(name),
             language=language,
         )
+        original_rel, original_source, original_sha256 = originals[
+            os.path.normpath(os.path.dirname(rel))
+        ]
         units.append(FunctionUnit(
             id=fid,
             source=src,
             signature_line=sig,
-            params=tuple(extract_params(sig, language)),
+            params=tuple(extract_params(signature_header(src, sig), language)),
             abs_path=ap,
+            original_rel=original_rel,
+            original_source=original_source,
+            original_sha256=original_sha256,
         ))
     return units

@@ -40,6 +40,29 @@ from typing import Dict, List, Sequence
 # --- the manifests (pure data; lossless migration of the 6 touchpoints) ------
 
 PLUGIN_MANIFESTS: Dict[str, dict] = {
+    "capability": {
+        "name": "capability",
+        "module": "src.plugins.capability",
+        "class_name": "CapabilityPlugin",
+        "work_subdir": "fm_agent_capability",
+        "results_subdir": "results",
+        "label": "Capability / resource integrity",
+        "verdicts": {
+            "positive": ["VULNERABLE"],
+            "poly": ["POLYMORPHIC"],
+            "review": ["NEEDS_REVIEW"],
+            "negative": ["SAFE"],
+        },
+        "cwes": ["CWE-669"],
+        "cwe_notes": {
+            "CWE-669": "incorrect resource transfer between spheres",
+        },
+        "property_nl": (
+            "incorrect transfer or mutation of protected resources without "
+            "the required capability"
+        ),
+        "benchmark_categories": [],
+    },
     "ifc": {
         "name": "ifc",
         "module": "src.plugins.ifc",

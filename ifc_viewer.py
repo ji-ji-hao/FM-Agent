@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# noqa: SIZE_OK - standalone zero-dependency viewer embeds its HTML, CSS, and JS.
 """IFC Trace Viewer — a zero-dependency web UI to inspect FM-Agent IFC runs.
 
 Usage:
@@ -60,7 +61,7 @@ def _safe_join(base, *parts):
     base_real = os.path.realpath(base)
     target = os.path.realpath(os.path.join(base_real, *parts))
     if target != base_real and not target.startswith(base_real + os.sep):
-        raise ValueError("path escapes base directory")
+        raise ValueError("path escapes base directory")  # noqa: GENERIC_ERR_OK
     return target
 
 
@@ -152,95 +153,102 @@ def _index_events(workspace):
     return by_fn, all_events
 
 
+def _result_key(function_id):
+    suffix = os.path.splitext(os.path.basename(function_id))[1]
+    return os.path.splitext(function_id)[0] if suffix else function_id
+
+
+def _result_listing(summary, results_dir):
+    listing = summary.get("results")
+    if listing:
+        return listing
+
+    listing = []
+    for root, _, files in os.walk(results_dir):
+        for filename in sorted(files):
+            if filename == "summary.json" or not filename.endswith(".json"):
+                continue
+            rel = os.path.relpath(os.path.join(root, filename), results_dir)
+            listing.append({
+                "function": rel[:-5],
+                "name": filename[:-5],
+                "verdict": "?",
+            })
+    return listing
+
+
+def _index_event_ids(workspace):
+    events_path = os.path.join(workspace, "trace", "events.jsonl")
+    by_fn = {}
+    total = 0
+    if not os.path.isfile(events_path):
+        return by_fn, total
+    with open(events_path, "r", errors="replace") as event_file:
+        for line in event_file:
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            total += 1
+            function_id = (event.get("metadata") or {}).get("function_id")
+            event_id = event.get("event_id")
+            if not function_id or not event_id:
+                continue
+            for key in {function_id, _result_key(function_id)}:
+                by_fn.setdefault(key, []).append(event_id)
+    return by_fn, total
+
+
+def _function_name(item, result, function_id):
+    name = item.get("name")
+    if name:
+        return name
+    result_function = result.get("function")
+    source_id = result_function if isinstance(result_function, str) else function_id
+    return os.path.basename(_result_key(source_id))
+
+
+def _locate_source(workspace, function_id, result):
+    extracted_dir = os.path.join(workspace, "extracted_functions")
+    result_function = result.get("function")
+    candidates = []
+    if isinstance(result_function, str):
+        candidates.append(result_function)
+    candidates.append(function_id)
+    base = _result_key(function_id)
+    candidates.extend(base + ext for ext in (
+        ".py", ".c", ".cpp", ".go", ".rs", ".java", ".ts", ".js",
+    ))
+    for rel_path in candidates:
+        source_path = _safe_join(extracted_dir, rel_path)
+        if os.path.isfile(source_path):
+            return os.path.relpath(source_path, workspace)
+    return None
+
+
 def load_run(proj_dir, plugin="ifc"):
-    """Load the full run into a structure the frontend consumes in one call."""
     cfg = PLUGINS.get(plugin) or PLUGINS["ifc"]
     workspace = _find_workspace(proj_dir, plugin)
     results_dir = _results_dir(workspace, cfg)
-    extracted_dir = os.path.join(workspace, "extracted_functions")
 
     summary = _read_json(os.path.join(results_dir, "summary.json")) or {}
-    by_fn_events, all_events = _index_events(workspace)
+    event_ids_by_fn, total_events = _index_event_ids(workspace)
 
     functions = []
-    # Drive the list from summary.results when present, else walk result files.
-    listing = summary.get("results")
-    if not listing:
-        listing = []
-        for root, _, files in os.walk(results_dir):
-            for fn in sorted(files):
-                if fn == "summary.json" or not fn.endswith(".json"):
-                    continue
-                rel = os.path.relpath(os.path.join(root, fn), results_dir)
-                listing.append({"function": rel[:-5], "name": fn[:-5], "verdict": "?"})
-
-    for item in listing:
-        rel_noext = item["function"]              # e.g. cross_function-py/_wrap.py OR ...-/x
-        # result json path
-        res_rel = rel_noext
-        if res_rel.endswith(".py") or "." in os.path.basename(res_rel):
-            # function id keeps source extension; result file is <id-without-ext>.json
-            res_key = os.path.splitext(res_rel)[0]
-        else:
-            res_key = res_rel
-        res_path = os.path.join(results_dir, res_key + ".json")
+    for item in _result_listing(summary, results_dir):
+        function_id = item["function"]
+        res_key = _result_key(function_id)
+        res_path = _safe_join(results_dir, res_key + ".json")
         result = _read_json(res_path) or {}
-
-        # function_id used in events is the extracted rel path (with extension)
-        fid = rel_noext if (rel_noext.count(".") and not rel_noext.endswith(".json")) else None
-        # best effort: match against event keys
-        events = by_fn_events.get(rel_noext, [])
-        if not events:
-            # try matching by basename
-            for k, evs in by_fn_events.items():
-                if os.path.splitext(k)[0] == res_key or os.path.basename(k).startswith(item["name"] + "."):
-                    events = evs
-                    break
-
-        # locate extracted source
-        src_path = None
-        cand = os.path.join(extracted_dir, rel_noext)
-        if os.path.isfile(cand):
-            src_path = cand
-        else:
-            base = res_key
-            for ext in (".py", ".c", ".cpp", ".go", ".rs", ".java", ".ts", ".js"):
-                c = os.path.join(extracted_dir, base + ext)
-                if os.path.isfile(c):
-                    src_path = c
-                    break
-
-        src_text = ""
-        if src_path:
-            try:
-                with open(src_path, "r", errors="replace") as sf:
-                    src_text = sf.read()
-            except OSError:
-                src_text = ""
-
+        result_function = result.get("function")
+        event_key = result_function if isinstance(result_function, str) else function_id
+        event_count = len(event_ids_by_fn.get(event_key, event_ids_by_fn.get(res_key, [])))
         functions.append({
-            "id": rel_noext,
-            "name": item.get("name"),
+            "id": res_key,
+            "name": _function_name(item, result, function_id),
             "verdict": result.get("verdict", item.get("verdict", "?")),
-            "result": result,
-            "source_path": os.path.relpath(src_path, workspace) if src_path else None,
-            "event_count": len(events),
-            "event_ids": [e.get("event_id") for e in events],
-            "_src": src_text,  # transient, removed before serialization
+            "event_count": event_count,
         })
-
-    edges = _compute_call_edges(functions)
-
-    # Attach per-function calls / called_by and drop the transient source text.
-    calls_map = {}
-    called_by_map = {}
-    for caller, callee in edges:
-        calls_map.setdefault(caller, []).append(callee)
-        called_by_map.setdefault(callee, []).append(caller)
-    for fn in functions:
-        fn["calls"] = sorted(set(calls_map.get(fn["name"], [])))
-        fn["called_by"] = sorted(set(called_by_map.get(fn["name"], [])))
-        fn.pop("_src", None)
 
     return {
         "proj_dir": proj_dir,
@@ -254,8 +262,37 @@ def load_run(proj_dir, plugin="ifc"):
         ] or [{"name": plugin, "label": cfg["label"]}],
         "summary": summary,
         "functions": functions,
-        "edges": [{"from": a, "to": b} for a, b in edges],
-        "total_events": len(all_events),
+        "edges": [],
+        "edges_deferred": True,
+        "total_events": total_events,
+    }
+
+
+def load_function(proj_dir, plugin, function_id):
+    cfg = PLUGINS.get(plugin) or PLUGINS["ifc"]
+    workspace = _find_workspace(proj_dir, plugin)
+    results_dir = _results_dir(workspace, cfg)
+    result_key = _result_key(function_id)
+    result_path = _safe_join(results_dir, result_key + ".json")
+    result = _read_json(result_path)
+    if result is None:
+        raise FileNotFoundError(function_id)
+
+    result_function = result.get("function")
+    event_key = result_function if isinstance(result_function, str) else function_id
+    event_ids_by_fn, _ = _index_event_ids(workspace)
+    event_ids = event_ids_by_fn.get(event_key, event_ids_by_fn.get(result_key, []))
+    source_path = _locate_source(workspace, function_id, result)
+    return {
+        "id": result_key,
+        "name": _function_name({}, result, function_id),
+        "verdict": result.get("verdict", "?"),
+        "result": result,
+        "source_path": source_path,
+        "event_count": len(event_ids),
+        "event_ids": event_ids,
+        "calls": [],
+        "called_by": [],
     }
 
 
@@ -383,7 +420,25 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, load_run(unquote(proj), plugin))
             except (FileNotFoundError, ValueError) as e:
                 return self._err(404, str(e))
-            except Exception as e:  # noqa
+            except Exception as e:  # noqa: BROAD_EXCEPT_OK
+                return self._err(500, f"{type(e).__name__}: {e}")
+
+        if path == "/api/function":
+            proj = (q.get("dir") or [""])[0]
+            function_id = (q.get("id") or [""])[0]
+            plugin = (q.get("plugin") or ["ifc"])[0]
+            if not proj or not function_id:
+                return self._err(400, "missing ?dir= and ?id=")
+            try:
+                detail = load_function(
+                    unquote(proj),
+                    plugin,
+                    unquote(function_id),
+                )
+                return self._send(200, detail)
+            except (FileNotFoundError, ValueError) as e:
+                return self._err(404, str(e))
+            except Exception as e:  # noqa: BROAD_EXCEPT_OK
                 return self._err(500, f"{type(e).__name__}: {e}")
 
         if path == "/api/source":
@@ -443,6 +498,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
 <title>IFC Trace Viewer</title>
 <style>
   :root{
@@ -463,6 +519,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
   header button{background:var(--accent);color:#fff;border:0;padding:6px 14px;border-radius:6px;
                 cursor:pointer;font:inherit;font-weight:600}
   header button:hover{filter:brightness(1.1)}
+  #load{color:var(--bg)}
   header select{background:var(--panel2);border:1px solid var(--border);color:var(--fg);
                 padding:6px 8px;border-radius:6px;font:inherit;cursor:pointer}
   #info{width:24px;height:24px;padding:0;border-radius:50%;background:var(--panel2);
@@ -579,6 +636,52 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .finding .fm{margin-top:3px}
   .obl{margin:5px 0;padding:6px 8px;background:var(--panel2);border:1px dashed var(--border);
        border-radius:6px;color:var(--muted)}
+  /* capability-specific */
+  .cap-overview{width:calc(100% - 16px);margin:8px;padding:7px 10px;background:var(--panel2);
+                border:1px solid var(--border);border-radius:6px;color:var(--fg);font:inherit;
+                text-align:left;cursor:pointer}
+  .cap-overview:hover,.cap-overview.active{border-color:var(--accent);color:var(--accent)}
+  .cap-hero{display:grid;grid-template-columns:minmax(180px,.7fr) minmax(0,1.3fr);gap:16px;
+            padding:16px;background:var(--panel2);border:1px solid var(--border);border-radius:8px}
+  .cap-verdict{display:flex;flex-direction:column;justify-content:center;gap:6px}
+  .cap-verdict strong{font-size:20px;line-height:1.2}
+  .cap-verdict .badge{align-self:flex-start;font-size:12px;padding:3px 9px}
+  .cap-metrics{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+  .cap-metric{min-width:0;padding:8px 10px;background:var(--panel);border:1px solid var(--border);border-radius:6px}
+  .cap-metric b{display:block;font-size:15px;color:var(--fg);overflow-wrap:anywhere}
+  .cap-metric span{color:var(--muted);font-size:11px}
+  .cap-chains{display:grid;gap:10px}
+  .cap-chain{background:var(--panel2);border:1px solid var(--border);border-radius:8px;overflow:hidden}
+  .cap-chain[open]{border-color:var(--accent)}
+  .cap-chain>summary{display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:10px;
+                     align-items:center;padding:10px 12px;cursor:pointer;list-style:none}
+  .cap-chain>summary::-webkit-details-marker{display:none}
+  .cap-chain>summary:hover{background:var(--panel)}
+  .cap-chain-title{font-weight:700;color:var(--fg)}
+  .cap-chain-route{min-width:0;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .cap-chain-body{padding:0 12px 12px;border-top:1px solid var(--border)}
+  .cap-route{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin:10px 0}
+  .cap-route>div{min-width:0;padding:8px;background:var(--panel);border-radius:6px;overflow-wrap:anywhere}
+  .cap-route .mod{display:block;margin-bottom:2px}
+  .cap-path{display:grid;gap:6px}
+  .cap-step{display:grid;grid-template-columns:110px minmax(130px,.7fr) minmax(0,1fr);gap:8px;
+            align-items:start;padding:7px 8px;background:var(--panel);border-left:3px solid var(--border);
+            border-radius:4px;overflow-wrap:anywhere}
+  .cap-step.critical{border-left-color:var(--accent)}
+  .cap-kind{font-size:10px;font-weight:700;color:var(--muted);letter-spacing:.3px}
+  .cap-fnbtn{padding:0;border:0;background:none;color:var(--accent);font:inherit;text-align:left;
+             cursor:pointer;overflow-wrap:anywhere}
+  .cap-fnbtn:hover{text-decoration:underline}
+  .cap-edge{min-width:0;color:var(--muted)}
+  .cap-edge code{color:var(--fg)}
+  .cap-hops{border:1px dashed var(--border);border-radius:5px}
+  .cap-hops>summary{padding:6px 8px;color:var(--muted);cursor:pointer}
+  .cap-hops .cap-path{padding:0 6px 6px}
+  .cap-flow{display:grid;grid-template-columns:90px minmax(0,1fr);gap:8px;padding:6px 8px;
+            border-bottom:1px solid var(--border);overflow-wrap:anywhere}
+  .cap-flow:last-child{border-bottom:0}
+  button:focus-visible,input:focus-visible,select:focus-visible,summary:focus-visible{
+    outline:2px solid var(--accent);outline-offset:2px}
   /* right: reasoning */
   #reason{flex:0 0 420px;background:var(--panel);border-left:1px solid var(--border);
           overflow:auto;display:flex;flex-direction:column}
@@ -611,6 +714,31 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .gedge.hot{stroke:var(--accent);opacity:1;stroke-width:2px}
   .gnode.dim{opacity:.28}
   .gedge.dim{opacity:.08}
+  @media (max-width:1100px){
+    header{flex-wrap:wrap}
+    header input{order:3;flex-basis:100%;min-width:0}
+    #stat{white-space:normal}
+    main{display:grid;grid-template-columns:260px minmax(0,1fr);grid-template-rows:minmax(0,1fr) 260px}
+    #list{grid-row:1 / span 2;grid-column:1;width:auto;flex-basis:auto}
+    #detail{grid-row:1;grid-column:2}
+    #reason{grid-row:2;grid-column:2;width:auto;flex-basis:auto;border-left:1px solid var(--border);
+            border-top:1px solid var(--border)}
+  }
+  @media (max-width:767px){
+    body{height:auto;min-height:100dvh}
+    header{flex-wrap:wrap}
+    header input{order:3;flex-basis:100%;min-width:0}
+    #stat{white-space:normal}
+    main{display:block;min-height:auto}
+    #list,#detail,#reason{width:auto;max-height:none;border:0;border-bottom:1px solid var(--border)}
+    #list{height:280px}
+    #detail{min-height:360px}
+    #reason{height:300px}
+    .cap-hero,.cap-route{grid-template-columns:1fr}
+    .cap-step{grid-template-columns:1fr}
+    .cap-chain>summary{grid-template-columns:auto minmax(0,1fr)}
+    .cap-chain>summary .badge{grid-column:2}
+  }
 </style>
 </head>
 <body>
@@ -625,7 +753,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <main>
   <div id="list"><div class="empty">Enter a directory and Load.</div></div>
   <div id="detail"><div class="empty">Select a function.</div></div>
-  <div id="reason"><div class="rh">Reasoning</div><div class="empty">Select a function.</div></div>
+  <div id="reason" tabindex="0"><div class="rh">Reasoning</div><div class="empty">Select a function.</div></div>
 </main>
 <div class="modal-bg" id="modalbg">
   <div class="modal">
@@ -963,6 +1091,24 @@ def f8b(data):
        and TOCTOU race-exploitability proof. Caller-dependent helpers are reported POLYMORPHIC, not
        guessed safe.</p>
      </div>
+     <div class="mb hide" id="modalbody-capability">
+       <h3>The idea in one minute</h3>
+       <p>FM-Agent-Capability tracks whether an externally controlled resource keeps the same
+       identity while it moves through fields, arguments, callback registration, and indirect
+       dispatch. It reports a conflict when that same resource reaches an operation that requires
+       write authority the original resource does not grant.</p>
+       <table>
+         <tr><td><span class="vchip vc-VULNERABLE">VULNERABLE</span></td><td>A source-backed same-resource chain reaches a write requirement and writeback.</td></tr>
+         <tr><td><span class="vchip vc-NEEDS_REVIEW">NEEDS_REVIEW</span></td><td>A plausible chain exists, but identity, authority, dispatch, or writeback evidence is incomplete.</td></tr>
+         <tr><td><span class="vchip vc-SAFE">SAFE</span></td><td>No conflicting source-to-write chain is reachable in the analyzed scope.</td></tr>
+         <tr><td><span class="vchip vc-ERROR">ERROR</span></td><td>The function abstraction could not be derived or validated.</td></tr>
+       </table>
+       <h3>How to read a chain</h3>
+       <div class="flow">SEED -> FIELD / ARG -> REQUIRE_WRITE -> REGISTER / DISPATCH -> WRITEBACK</div>
+       <p>The overview keeps obligation and dispatch boundaries visible and folds ordinary
+       propagation hops. Open a folded group for every field and argument transfer, or select a
+       function to inspect its source and full model exchange.</p>
+     </div>
    </div>
 </div>
 <script>
@@ -977,6 +1123,7 @@ async function api(path){const r=await fetch(path);const j=await r.json();if(!r.
 const PLUGIN_VERDICTS={
   ifc:["LEAK","DECLASSIFIED","POLYMORPHIC","SECURE","ERROR"],
   authz:["VULNERABLE","NEEDS_REVIEW","SAFE","ERROR"],
+  capability:["VULNERABLE","NEEDS_REVIEW","SAFE","ERROR"],
 };
 function verdicts(){ return (RUN&&RUN.verdicts)||PLUGIN_VERDICTS[PLUGIN]||PLUGIN_VERDICTS.ifc; }
 
@@ -998,13 +1145,19 @@ async function loadRun(){
     syncPluginSelector();
     FILTER=new Set(verdicts());
     CUR=null;
-    renderList(); $("#detail").innerHTML='<div class="empty">Select a function.</div>';
-    $("#reason").innerHTML='<div class="rh">'+esc(reasonTitle())+'</div><div class="empty">Select a function.</div>';
+    renderList();
+    if(PLUGIN==="capability"){
+      renderCapabilityOverview();
+      renderCapabilitySummaryAside();
+    }else{
+      $("#detail").innerHTML='<div class="empty">Select a function.</div>';
+      $("#reason").innerHTML='<div class="rh">'+esc(reasonTitle())+'</div><div class="empty">Select a function.</div>';
+    }
     $("#stat").textContent=`${esc(RUN.plugin_label||PLUGIN)} · ${RUN.functions.length} fns · ${RUN.total_events} llm calls`;
   }catch(e){ $("#list").innerHTML='<div class="empty">'+esc(e.message)+'</div>'; $("#stat").textContent="error"; }
 }
 
-function reasonTitle(){ return PLUGIN==="authz" ? "Authorization Reasoning" : PLUGIN==="authn" ? "Authentication Reasoning" : PLUGIN==="taint" ? "Taint Reasoning" : PLUGIN==="crypto" ? "Crypto Reasoning" : PLUGIN==="typestate" ? "Typestate Reasoning" : PLUGIN==="resource" ? "Resource Reasoning" : "IFC Reasoning"; }
+function reasonTitle(){ return PLUGIN==="authz" ? "Authorization Reasoning" : PLUGIN==="authn" ? "Authentication Reasoning" : PLUGIN==="taint" ? "Taint Reasoning" : PLUGIN==="crypto" ? "Crypto Reasoning" : PLUGIN==="typestate" ? "Typestate Reasoning" : PLUGIN==="resource" ? "Resource Reasoning" : PLUGIN==="capability" ? "Capability Evidence" : "IFC Reasoning"; }
 
 function syncPluginSelector(){
   const sel=$("#plugin");
@@ -1045,6 +1198,13 @@ function renderList(){
     bar.appendChild(p);
   });
   list.appendChild(bar);
+
+  if(PLUGIN==="capability"){
+    const overview=ce("button","cap-overview"+(CUR?"":" active"));
+    overview.textContent="Project capability chains";
+    overview.onclick=()=>{CUR=null;renderList();renderCapabilityOverview();renderCapabilitySummaryAside();};
+    list.appendChild(overview);
+  }
 
   if(VIEW==="graph"){ renderGraph(list); return; }
 
@@ -1163,8 +1323,21 @@ function labelSpan(l){return `<span class="lbl l-${esc(l)}">${esc(l)}</span>`;}
 
 async function selectFn(f){
   CUR=f; renderList();
-  renderDetail(f);
-  renderReason(f);
+  $("#detail").innerHTML='<div class="empty">loading function details…</div>';
+  $("#reason").innerHTML='<div class="rh">'+esc(reasonTitle())+'</div><div class="empty">loading event index…</div>';
+  try{
+    if(!f.detail_loaded){
+      const detail=await api("/api/function?plugin="+encodeURIComponent(PLUGIN)+"&dir="+encodeURIComponent(RUN.proj_dir)+"&id="+encodeURIComponent(f.id));
+      Object.assign(f,detail,{detail_loaded:true});
+    }
+    if(CUR!==f)return;
+    await renderDetail(f);
+    renderReason(f);
+  }catch(e){
+    if(CUR!==f)return;
+    $("#detail").innerHTML='<div class="empty">'+esc(e.message)+'</div>';
+    $("#reason").innerHTML='<div class="rh">'+esc(reasonTitle())+'</div><div class="empty">function details unavailable</div>';
+  }
 }
 
 async function renderDetail(f){
@@ -1191,6 +1364,7 @@ async function renderDetail(f){
   else if(PLUGIN==="crypto") renderCryptoDetail(d,f,r);
   else if(PLUGIN==="typestate") renderTypestateDetail(d,f,r);
   else if(PLUGIN==="resource") renderResourceDetail(d,f,r);
+  else if(PLUGIN==="capability") renderCapabilityDetail(d,f,r);
   else renderIfcDetail(d,f,r);
 }
 
@@ -1256,6 +1430,159 @@ function renderIfcDetail(d,f,r){
   }
 
   if(r.error) d.appendChild(section("Error",`<pre>${esc(r.error)}</pre>`));
+}
+
+const CAPABILITY_CRITICAL_KINDS=new Set(["SEED","REQUIRE_WRITE","REGISTER","DISPATCH","WRITEBACK"]);
+
+function capabilityRel(value){
+  return String(value||"").replace(/\\/g,"/").replace(/\.(c|cc|cpp|cxx|h|hpp|py|go|rs|java|js|ts)$/i,"");
+}
+
+function capabilityFunctionName(rel){
+  const normalized=capabilityRel(rel);
+  return normalized ? normalized.split("/").pop() : "unknown function";
+}
+
+function capabilityFunctionButton(rel){
+  if(!rel)return '<span class="mod">unknown function</span>';
+  return `<button class="cap-fnbtn" data-cap-fn="${encodeURIComponent(String(rel))}">${esc(capabilityFunctionName(rel))}</button>`;
+}
+
+function selectCapabilityFunction(rel){
+  const target=capabilityRel(rel);
+  const f=(RUN.functions||[]).find(item=>{
+    const id=capabilityRel(item.id);
+    const source=capabilityRel(item.source_path);
+    return id===target || source.endsWith("/"+target);
+  });
+  if(f)selectFn(f);
+}
+
+function bindCapabilityLinks(root){
+  root.querySelectorAll("[data-cap-fn]").forEach(button=>{
+    button.onclick=()=>selectCapabilityFunction(decodeURIComponent(button.dataset.capFn));
+  });
+}
+
+function capabilityStepHtml(step,critical){
+  const kind=step.kind||"FLOW";
+  const from=step.from||"unknown";
+  const to=step.to||"unknown";
+  return `<div class="cap-step${critical?' critical':''}">`+
+    `<span class="cap-kind">${esc(kind)}</span>`+
+    `<span>${capabilityFunctionButton(step.function)}</span>`+
+    `<span class="cap-edge"><code>${esc(from)}</code> &rarr; <code>${esc(to)}</code></span>`+
+    `</div>`;
+}
+
+function capabilityPathHtml(path){
+  let html="",hops=[];
+  const flush=()=>{
+    if(!hops.length)return;
+    html+=`<details class="cap-hops"><summary>${hops.length} propagation hop${hops.length===1?'':'s'}</summary>`+
+      `<div class="cap-path">${hops.map(step=>capabilityStepHtml(step,false)).join("")}</div></details>`;
+    hops=[];
+  };
+  (path||[]).forEach(step=>{
+    if(CAPABILITY_CRITICAL_KINDS.has(step.kind)){
+      flush();
+      html+=capabilityStepHtml(step,true);
+    }else{
+      hops.push(step);
+    }
+  });
+  flush();
+  return `<div class="cap-path">${html||'<div class="empty">No path steps.</div>'}</div>`;
+}
+
+function renderCapabilityOverview(){
+  const d=$("#detail"),s=RUN.summary||{},scope=s.analysis_scope||{};
+  const strictFindings=s.strict_findings||[];
+  const candidateFindings=s.candidate_findings||s.findings||[];
+  const findings=[...strictFindings,...candidateFindings];
+  d.innerHTML="";
+  const head=ce("div","sec");
+  head.innerHTML=`<h2><span>Project capability analysis <span class="badge b-${esc(s.verdict||'ERROR')}">${esc(s.verdict||'ERROR')}</span></span><span class="mod">${esc(RUN.proj_dir||"")}</span></h2>`;
+  d.appendChild(head);
+  const hero=`<div class="cap-hero"><div class="cap-verdict">`+
+    `<span class="badge b-${esc(s.verdict||'ERROR')}">${esc(s.verdict||'ERROR')}</span>`+
+    `<strong>${findings.length?`${strictFindings.length} strict / ${candidateFindings.length} candidate chain${findings.length===1?'':'s'}`:'No complete conflict chain'}</strong>`+
+    `<span class="mod">${esc(s.reason||s.missing_premise||"analysis complete")}</span></div>`+
+    `<div class="cap-metrics">`+
+    `<div class="cap-metric"><b>${esc(scope.selected_functions??0)} / ${esc(scope.program_functions??0)}</b><span>functions analyzed</span></div>`+
+    `<div class="cap-metric"><b>${esc(s.strict_path_count??strictFindings.length)}</b><span>strict paths</span></div>`+
+    `<div class="cap-metric"><b>${esc(s.candidate_path_count??0)}</b><span>candidate paths</span></div>`+
+    `<div class="cap-metric"><b>${esc(s.confidence||"unknown")}</b><span>confidence</span></div>`+
+    `<div class="cap-metric"><b>${esc(scope.contract_mode||"none")}</b><span>contract mode</span></div>`+
+    `</div></div>`;
+  d.appendChild(section("Project verdict",hero));
+  if(!findings.length){
+    d.appendChild(section("Conflict chains",'<div class="empty">No complete source-to-write chain was reported.</div>'));
+    return;
+  }
+  let chains='<div class="cap-chains">';
+  findings.forEach((finding,index)=>{
+    const strict=index<strictFindings.length;
+    if(index===0&&strictFindings.length)chains+='<h3>Strict chains</h3>';
+    if(index===strictFindings.length&&candidateFindings.length)chains+='<h3>Candidate chains <span class="mod">(need verification)</span></h3>';
+    const sig=finding.signature||{},route=sig.route||{},path=finding.path||[];
+    const seedStep=path.find(step=>step.kind==="SEED")||{};
+    const writeStep=[...path].reverse().find(step=>step.kind==="WRITEBACK")||{};
+    const obligationStep=path.find(step=>step.kind==="REQUIRE_WRITE")||{};
+    const seed=sig.seed_function||seedStep.function||"";
+    const sink=sig.writeback_function||route.implementation||writeStep.function||"";
+    const obligationFunction=sig.obligation_function||obligationStep.function||"";
+    const seedResource=sig.seed_resource||seedStep.from||seedStep.to||"unknown";
+    const writebackResource=sig.writeback_resource||writeStep.to||writeStep.from||"unknown";
+    const obligationResource=sig.obligation_resource||obligationStep.to||obligationStep.from||"unknown";
+    chains+=`<details class="cap-chain"${index===0?' open':''}><summary>`+
+      `<span class="cap-chain-title">${strict?'Strict':'Candidate'} chain ${strict?index+1:index-strictFindings.length+1}</span>`+
+      `<span class="cap-chain-route">${esc(capabilityFunctionName(seed))} &rarr; ${esc(capabilityFunctionName(sink))}</span>`+
+      `<span class="badge b-${strict?'VULNERABLE':'NEEDS_REVIEW'}">${esc(path.length)} steps</span></summary>`+
+      `<div class="cap-chain-body"><div class="cap-route">`+
+      `<div><span class="mod">Seed</span>${capabilityFunctionButton(seed)}<br><code>${esc(seedResource)}</code></div>`+
+      `<div><span class="mod">Writeback</span>${capabilityFunctionButton(sink)}<br><code>${esc(writebackResource)}</code></div>`+
+      `<div><span class="mod">Write obligation</span>${capabilityFunctionButton(obligationFunction)}<br><code>${esc(obligationResource)}</code></div>`+
+      `<div><span class="mod">Dispatch</span><code>${esc(route.slot||route.kind||"direct")}</code><br>${capabilityFunctionButton(route.implementation)}</div>`+
+      `</div>${capabilityPathHtml(path)}</div></details>`;
+  });
+  chains+='</div>';
+  d.appendChild(section("Conflict chains",chains));
+  bindCapabilityLinks(d);
+}
+
+function renderCapabilitySummaryAside(){
+  const r=$("#reason"),s=RUN.summary||{},scope=s.analysis_scope||{};
+  const packs=(scope.contract_packs||[]).map(pack=>`<span class="dep">${esc(pack)}</span>`).join("")||'<span class="mod">none</span>';
+  const gaps=(s.gaps||[]).map(gap=>`<div class="obl">${esc(typeof gap==="string"?gap:JSON.stringify(gap))}</div>`).join("")||'<div class="mod">No project-level gaps.</div>';
+  r.innerHTML='<div class="rh">'+esc(reasonTitle())+'</div>'+
+    `<div class="sec"><h2><span>Analysis scope</span></h2><div class="body"><table class="kv">`+
+    `<tr><td class="k">selected</td><td>${esc(scope.selected_functions??0)} of ${esc(scope.program_functions??0)} functions</td></tr>`+
+    `<tr><td class="k">contracts</td><td>${packs}</td></tr>`+
+    `<tr><td class="k">fallback</td><td>${esc(scope.fallback??false)}</td></tr>`+
+    `<tr><td class="k">reason</td><td>${esc(s.reason||"complete")}</td></tr>`+
+    `</table></div></div><div class="sec"><h2><span>Coverage gaps</span></h2><div class="body">${gaps}</div></div>`;
+}
+
+function renderCapabilityDetail(d,f,r){
+  const flows=r.resource_flows||[],path=r.path||[];
+  const status=`<table class="kv"><tr><td class="k">verdict</td><td><span class="badge b-${esc(r.verdict||f.verdict)}">${esc(r.verdict||f.verdict)}</span></td></tr>`+
+    `<tr><td class="k">facts status</td><td>${esc(r.facts_status||r.status||"unknown")}</td></tr>`+
+    `<tr><td class="k">missing premise</td><td>${esc(r.missing_premise||"none")}</td></tr>`+
+    `<tr><td class="k">resource transfers</td><td>${flows.length}</td></tr></table>`;
+  d.appendChild(section("Capability status",status));
+  if(path.length)d.appendChild(section("Local capability path",capabilityPathHtml(path)));
+  if(flows.length){
+    const flowHtml=flow=>`<div class="cap-flow"><span class="cap-kind">${esc(flow.effect||"FLOW")}</span>`+
+      `<span>${capabilityFunctionButton(flow.from_function)} &rarr; ${capabilityFunctionButton(flow.to_function)}<br>`+
+      `<code>${esc(flow.actual||flow.resource_id||"unknown")}</code> &rarr; <code>${esc(flow.formal||"unknown")}</code></span></div>`;
+    const first=flows.slice(0,12).map(flowHtml).join("");
+    const rest=flows.length>12?`<details class="cap-hops"><summary>Show ${flows.length-12} more transfers</summary>${flows.slice(12).map(flowHtml).join("")}</details>`:"";
+    d.appendChild(section("Resource transfers",first+rest));
+  }else{
+    d.appendChild(section("Resource transfers",'<div class="empty">No cross-function resource transfers.</div>'));
+  }
+  bindCapabilityLinks(d);
 }
 
 function renderAuthzDetail(d,f,r){
@@ -1889,6 +2216,7 @@ async function renderReason(f){
       }catch(err){ body.innerHTML='<div class="empty">'+esc(err.message)+'</div>'; }
     };
     ev.appendChild(head); ev.appendChild(body); r.appendChild(ev);
+    if(eid===f.event_ids[0])head.click();
   }
 }
 
@@ -1900,20 +2228,21 @@ $("#plugin").addEventListener("change",e=>{
   loadRun();
 });
 $("#info").onclick=()=>{
-  const titles={ifc:"About FM-Agent-IFC",authz:"About FM-Agent-Authz",taint:"About FM-Agent-Taint",crypto:"About FM-Agent-Crypto",typestate:"About FM-Agent-Typestate"};
+  const titles={ifc:"About FM-Agent-IFC",authz:"About FM-Agent-Authz",taint:"About FM-Agent-Taint",crypto:"About FM-Agent-Crypto",typestate:"About FM-Agent-Typestate",capability:"About FM-Agent-Capability"};
   $("#modaltitle").textContent=titles[PLUGIN]||titles.ifc;
   $("#modalbody-ifc").classList.toggle("hide",PLUGIN!=="ifc");
   $("#modalbody-authz").classList.toggle("hide",PLUGIN!=="authz");
   $("#modalbody-taint").classList.toggle("hide",PLUGIN!=="taint");
   $("#modalbody-crypto").classList.toggle("hide",PLUGIN!=="crypto");
   $("#modalbody-typestate").classList.toggle("hide",PLUGIN!=="typestate");
+  $("#modalbody-capability").classList.toggle("hide",PLUGIN!=="capability");
   $("#modalbg").classList.add("show");
 };
 $("#modalclose").onclick=()=>$("#modalbg").classList.remove("show");
 $("#modalbg").addEventListener("click",e=>{if(e.target===$("#modalbg"))$("#modalbg").classList.remove("show");});
 document.addEventListener("keydown",e=>{if(e.key==="Escape")$("#modalbg").classList.remove("show");});
 // seed selector with known plugins until a run reports availability.
-(function(){const sel=$("#plugin");const a=ce("option");a.value="__auto__";a.textContent="Auto-detect";a.selected=true;sel.appendChild(a);[["ifc","IFC (information flow)"],["authz","Access control (guarded-Hoare)"],["taint","Integrity taint (injection)"],["crypto","Crypto misuse"],["typestate","Typestate / temporal"]].forEach(([n,l])=>{const o=ce("option");o.value=n;o.textContent=l;sel.appendChild(o);});})();
+(function(){const sel=$("#plugin");const a=ce("option");a.value="__auto__";a.textContent="Auto-detect";a.selected=true;sel.appendChild(a);[["ifc","IFC (information flow)"],["authz","Access control (guarded-Hoare)"],["taint","Integrity taint (injection)"],["crypto","Crypto misuse"],["typestate","Typestate / temporal"],["capability","Capability integrity"]].forEach(([n,l])=>{const o=ce("option");o.value=n;o.textContent=l;sel.appendChild(o);});})();
 if(DEFAULT_DIR){ $("#dir").value=DEFAULT_DIR; loadRun(); }
 </script>
 </body>

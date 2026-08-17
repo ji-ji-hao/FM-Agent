@@ -20,7 +20,7 @@ REASONER_SPEC_CHECK_MODEL = LLM_MODEL
 
 MAX_SPC_ITER = 5
 GRANULARITY = 40
-MAX_WORKERS = 10
+MAX_WORKERS = 32
 OPENCODE_MAX_RETRIES = 5
 
 # Number of retries (in addition to the initial attempt) when validating a candidate bug;
